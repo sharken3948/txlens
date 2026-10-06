@@ -6,6 +6,7 @@ import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createGatewayMiddleware } from "@circle-fin/x402-batching/server";
+import { analyzeWithEnrichment, type ReceiptLog } from "./src/server/abiEnrichment";
 import {
   ARC_NETWORK,
   ARC_USDC,
@@ -293,20 +294,26 @@ async function fetchArcTransaction(
   return { ok: true, tx: body.result };
 }
 
-async function fetchTransactionStatus(txHash: string): Promise<"success" | "failed" | "pending" | "unknown"> {
+async function fetchTransactionReceipt(txHash: string): Promise<{
+  status: "success" | "failed" | "pending" | "unknown";
+  logs: ReceiptLog[];
+}> {
   try {
     const resp = await fetch(getArcRpcUrl(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_getTransactionReceipt", params: [txHash] }),
     });
-    if (!resp.ok) return "unknown";
-    interface ReceiptResponse { result: { status: string } | null; error?: { message: string }; }
+    if (!resp.ok) return { status: "unknown", logs: [] };
+    interface ReceiptResponse { result: { status: string; logs?: ReceiptLog[] } | null; error?: { message: string }; }
     const body = (await resp.json()) as ReceiptResponse;
-    if (body.error || !body.result) return "pending";
-    return body.result.status === "0x1" ? "success" : "failed";
+    if (body.error || !body.result) return { status: "pending", logs: [] };
+    return {
+      status: body.result.status === "0x1" ? "success" : "failed",
+      logs: Array.isArray(body.result.logs) ? body.result.logs : [],
+    };
   } catch {
-    return "unknown";
+    return { status: "unknown", logs: [] };
   }
 }
 
@@ -411,7 +418,7 @@ app.post("/api/analyze", async (req, res) => {
     return;
   }
   try {
-    res.json(analyze(body));
+    res.json(await analyzeWithEnrichment(body));
   } catch (err) {
     console.error("[TxLens] analyze error:", err);
     res.status(500).json({ error: "Internal analysis error", detail: String(err) });
@@ -447,17 +454,17 @@ app.post("/api/lookup-tx", async (req, res) => {
   }
 
   const { tx } = fetchResult;
-  const status = await fetchTransactionStatus(txHash);
+  const receipt = await fetchTransactionReceipt(txHash);
 
   let valueDecimal = "0";
   try { valueDecimal = hexToBigInt(tx.value).toString(); } catch { valueDecimal = "0"; }
 
-  const analysis = analyze({
+  const analysis = await analyzeWithEnrichment({
     chainId,
     to: tx.to ?? "0x0000000000000000000000000000000000000000",
     data: tx.input,
     value: valueDecimal
-  });
+  }, { logs: receipt.logs });
 
   res.json({
     transaction: {
@@ -467,7 +474,7 @@ app.post("/api/lookup-tx", async (req, res) => {
       value: valueDecimal,
       valueHex: tx.value,
       input: tx.input,
-      status,
+      status: receipt.status,
       blockNumber: tx.blockNumber ? parseInt(tx.blockNumber, 16) : null,
       network: ARC_MAINNET.name,
       explorerUrl: `${ARC_MAINNET.explorer}/tx/${tx.hash}`,
@@ -477,7 +484,7 @@ app.post("/api/lookup-tx", async (req, res) => {
 });
 
 
-app.post("/api/analyze/gateway", gateway.require("$0.002"), (req, res) => {
+app.post("/api/analyze/gateway", gateway.require("$0.002"), async (req, res) => {
   const body = req.body as AnalyzeRequest;
   if (Number(body?.chainId) !== ARC_MAINNET.chainId) {
     res.status(400).json({ error: "TxLens production supports Arc Mainnet only (chain ID 5042)." });
@@ -487,7 +494,7 @@ app.post("/api/analyze/gateway", gateway.require("$0.002"), (req, res) => {
     res.status(400).json({ error: "Missing required field: to" });
     return;
   }
-  try { res.json(analyze(body)); }
+  try { res.json(await analyzeWithEnrichment(body)); }
   catch (err) { res.status(500).json({ error: "Internal analysis error", detail: String(err) }); }
 });
 
@@ -501,19 +508,19 @@ app.post("/api/lookup-tx/gateway", gateway.require("$0.003"), async (req, res) =
   const fetchResult = await fetchArcTransaction(txHash);
   if (!fetchResult.ok) { res.status(404).json({ error: fetchResult.error }); return; }
   const { tx } = fetchResult;
-  const status = await fetchTransactionStatus(txHash);
+  const receipt = await fetchTransactionReceipt(txHash);
   let valueDecimal = "0";
   try { valueDecimal = hexToBigInt(tx.value).toString(); } catch {}
-  const analysis = analyze({
+  const analysis = await analyzeWithEnrichment({
     chainId,
     to: tx.to ?? "0x0000000000000000000000000000000000000000",
     data: tx.input,
     value: valueDecimal,
-  });
+  }, { logs: receipt.logs });
   res.json({
     transaction: {
       hash: tx.hash, from: tx.from, to: tx.to, value: valueDecimal, valueHex: tx.value,
-      input: tx.input, status,
+      input: tx.input, status: receipt.status,
       blockNumber: tx.blockNumber ? parseInt(tx.blockNumber, 16) : null,
       network: ARC_MAINNET.name,
       explorerUrl: `${ARC_MAINNET.explorer}/tx/${tx.hash}`,

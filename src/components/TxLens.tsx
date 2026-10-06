@@ -36,6 +36,23 @@ type Analysis = {
   confidence: number;
   warnings: Warning[];
   decoded: Record<string, unknown>;
+  function?: string;
+  events?: Array<{
+    address: string;
+    topic0: string | null;
+    decoded: boolean;
+    event?: string;
+    signature?: string;
+    arguments?: Record<string, unknown>;
+    source?: string;
+  }>;
+  enrichment?: {
+    source: string;
+    contract: string;
+    implementation: string | null;
+    contractName?: string;
+    sourceUrl?: string;
+  };
 };
 type TxMeta = {
   hash: string;
@@ -302,8 +319,19 @@ function AnalysisCard({ result, transaction }: { result: Analysis; transaction?:
         <div className="rounded-xl p-3" style={{ background: "var(--surface-muted)" }}><div className="text-[var(--subtle)]">Network</div><div className="mt-1 font-semibold">Arc Mainnet</div></div>
       </div>
       {transaction && <div className="space-y-2 text-xs"><div className="font-semibold">Transaction</div><div className="mono break-all text-[var(--muted)]">{transaction.hash}</div>{transaction.explorerUrl && <a className="inline-flex items-center gap-1 text-[var(--accent)]" href={transaction.explorerUrl} target="_blank" rel="noreferrer">View on Arc Explorer <ExternalLink size={11} /></a>}</div>}
+      {result.enrichment && <div className="rounded-xl p-3 text-xs space-y-1" style={{ background: "var(--surface-muted)" }}>
+        <div className="font-semibold">Contract-specific decoding</div>
+        <div className="text-[var(--muted)]">{result.enrichment.contractName ?? "Verified contract"} · {result.function}</div>
+        <div className="mono break-all text-[var(--subtle)]">{result.enrichment.contract}</div>
+        {result.enrichment.implementation && <div className="mono break-all text-[var(--subtle)]">Implementation: {result.enrichment.implementation}</div>}
+        {result.enrichment.sourceUrl && <a className="inline-flex items-center gap-1 text-[var(--accent)]" href={result.enrichment.sourceUrl} target="_blank" rel="noreferrer">View decoding source <ExternalLink size={11} /></a>}
+      </div>}
       {result.warnings.map((warning) => <div key={warning.type + warning.message} className="rounded-xl border border-amber-400/30 bg-amber-400/5 p-3 text-xs"><div className="flex items-center gap-2 font-semibold text-amber-300"><AlertTriangle size={13} />{warning.type}</div><div className="mt-1 text-[var(--muted)]">{warning.message}</div></div>)}
       {Object.keys(result.decoded).length > 0 && <pre className="overflow-auto rounded-xl p-3 text-xs" style={{ background: "var(--surface-muted)" }}>{JSON.stringify(result.decoded, null, 2)}</pre>}
+      {result.events && result.events.length > 0 && <details className="text-xs">
+        <summary className="cursor-pointer font-semibold text-[var(--accent)]">Receipt events ({result.events.filter((event) => event.decoded).length} decoded / {result.events.length})</summary>
+        <pre className="mt-2 overflow-auto rounded-xl p-3" style={{ background: "var(--surface-muted)" }}>{JSON.stringify(result.events, null, 2)}</pre>
+      </details>}
     </div>
   );
 }

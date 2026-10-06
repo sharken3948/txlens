@@ -1,27 +1,13 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useAccount, usePublicClient, useSignTypedData, useSwitchChain, useWriteContract } from "wagmi";
 import { arc } from "viem/chains";
 import { parseSignature } from "viem";
-
-const ARC_USDC = "0x3600000000000000000000000000000000000000" as const;
-
-const USDC_AUTH_ABI = [{
-  type: "function",
-  name: "transferWithAuthorization",
-  stateMutability: "nonpayable",
-  inputs: [
-    { name: "from", type: "address" },
-    { name: "to", type: "address" },
-    { name: "value", type: "uint256" },
-    { name: "validAfter", type: "uint256" },
-    { name: "validBefore", type: "uint256" },
-    { name: "nonce", type: "bytes32" },
-    { name: "v", type: "uint8" },
-    { name: "r", type: "bytes32" },
-    { name: "s", type: "bytes32" },
-  ],
-  outputs: [],
-}] as const;
+import {
+  ARC_USDC,
+  ARC_USDC_EIP712_DOMAIN,
+  TRANSFER_WITH_AUTHORIZATION_TYPES,
+  USDC_AUTH_ABI_VRS,
+} from "@/payments/direct";
 
 type DirectRoute = "analyze" | "lookup";
 type Quote = {
@@ -35,6 +21,25 @@ type Quote = {
   payTo: `0x${string}`;
   asset: `0x${string}`;
 };
+
+type PaidProof = {
+  bodySnapshot: string;
+  quote: Quote;
+  txHash: `0x${string}`;
+};
+
+function errorMessage(error: unknown): string {
+  if (error && typeof error === "object") {
+    const candidate = error as {
+      shortMessage?: string;
+      details?: string;
+      message?: string;
+      cause?: { reason?: string; shortMessage?: string };
+    };
+    return candidate.cause?.reason ?? candidate.cause?.shortMessage ?? candidate.shortMessage ?? candidate.details ?? candidate.message ?? String(error);
+  }
+  return String(error);
+}
 
 export type DirectPaymentStatus =
   | "idle"
@@ -65,6 +70,7 @@ export function useDirectPayment({
   const [status, setStatus] = useState<DirectPaymentStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [txHash, setTxHash] = useState<`0x${string}` | null>(null);
+  const paidProof = useRef<PaidProof | null>(null);
 
   const reset = useCallback(() => {
     setStatus("idle");
@@ -74,6 +80,37 @@ export function useDirectPayment({
 
   const pay = useCallback(async () => {
     setError(null);
+    const bodySnapshot = JSON.stringify(body);
+    const endpoint = route === "analyze" ? "/api/analyze" : "/api/lookup-tx";
+
+    const submitPaidRequest = async (proof: PaidProof) => {
+      setStatus("verifying");
+      const paidResp = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-TxLens-Payment-Quote": proof.quote.token,
+          "X-TxLens-Payment-Tx": proof.txHash,
+        },
+        body: JSON.stringify(body),
+      });
+      const payload = await paidResp.json();
+      if (!paidResp.ok) throw new Error(payload.error ?? `Server returned ${paidResp.status} after direct payment.`);
+      setStatus("success");
+      onSuccess(payload);
+    };
+
+    if (paidProof.current?.bodySnapshot === bodySnapshot) {
+      try {
+        await submitPaidRequest(paidProof.current);
+      } catch (err) {
+        setStatus("error");
+        setError(`${errorMessage(err)} Your confirmed payment is saved; retry will not charge you again.`);
+      }
+      return;
+    }
+    paidProof.current = null;
+
     if (!isConnected || !address) {
       setStatus("wallet_disconnected");
       setError("Connect your wallet to pay directly.");
@@ -97,22 +134,8 @@ export function useDirectPayment({
 
       setStatus("awaiting_signature");
       const signature = await signTypedDataAsync({
-        domain: {
-          name: "USD Coin",
-          version: "2",
-          chainId: arc.id,
-          verifyingContract: ARC_USDC,
-        },
-        types: {
-          TransferWithAuthorization: [
-            { name: "from", type: "address" },
-            { name: "to", type: "address" },
-            { name: "value", type: "uint256" },
-            { name: "validAfter", type: "uint256" },
-            { name: "validBefore", type: "uint256" },
-            { name: "nonce", type: "bytes32" },
-          ],
-        },
+        domain: ARC_USDC_EIP712_DOMAIN,
+        types: TRANSFER_WITH_AUTHORIZATION_TYPES,
         primaryType: "TransferWithAuthorization",
         message: {
           from: address,
@@ -123,52 +146,55 @@ export function useDirectPayment({
           nonce: quote.nonce,
         },
       });
-      const { v, r, s } = parseSignature(signature);
+      const { v, r, s, yParity } = parseSignature(signature);
+      const signatureV = v ?? BigInt((yParity ?? 0) + 27);
+
+      if (!publicClient) throw new Error("Arc client unavailable.");
+      const contractArgs = [
+        address,
+        quote.payTo,
+        BigInt(quote.amount),
+        BigInt(quote.validAfter),
+        BigInt(quote.validBefore),
+        quote.nonce,
+        Number(signatureV),
+        r,
+        s,
+      ] as const;
 
       setStatus("submitting");
+      try {
+        await publicClient.simulateContract({
+          account: address,
+          address: ARC_USDC,
+          abi: USDC_AUTH_ABI_VRS,
+          functionName: "transferWithAuthorization",
+          args: contractArgs,
+        });
+      } catch (simulationError) {
+        throw new Error(`Direct USDC payment simulation failed: ${errorMessage(simulationError)}`);
+      }
       const hash = await writeContractAsync({
         chainId: arc.id,
         address: ARC_USDC,
-        abi: USDC_AUTH_ABI,
+        abi: USDC_AUTH_ABI_VRS,
         functionName: "transferWithAuthorization",
-        args: [
-          address,
-          quote.payTo,
-          BigInt(quote.amount),
-          BigInt(quote.validAfter),
-          BigInt(quote.validBefore),
-          quote.nonce,
-          Number(v),
-          r,
-          s,
-        ],
+        args: contractArgs,
       });
       setTxHash(hash);
 
       setStatus("confirming");
-      if (!publicClient) throw new Error("Arc client unavailable.");
       const receipt = await publicClient.waitForTransactionReceipt({ hash });
       if (receipt.status !== "success") throw new Error("Direct USDC payment transaction failed.");
 
-      setStatus("verifying");
-      const endpoint = route === "analyze" ? "/api/analyze" : "/api/lookup-tx";
-      const paidResp = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-TxLens-Payment-Quote": quote.token,
-          "X-TxLens-Payment-Tx": hash,
-        },
-        body: JSON.stringify(body),
-      });
-      const payload = await paidResp.json();
-      if (!paidResp.ok) throw new Error(payload.error ?? `Server returned ${paidResp.status} after direct payment.`);
-
-      setStatus("success");
-      onSuccess(payload);
+      paidProof.current = { bodySnapshot, quote, txHash: hash };
+      await submitPaidRequest(paidProof.current);
     } catch (err) {
       setStatus("error");
-      setError(err instanceof Error ? err.message : String(err));
+      const retryNote = paidProof.current?.bodySnapshot === bodySnapshot
+        ? " Your confirmed payment is saved; retry will not charge you again."
+        : "";
+      setError(`${errorMessage(err)}${retryNote}`);
     }
   }, [address, body, chainId, isConnected, onSuccess, publicClient, route, signTypedDataAsync, switchChainAsync, writeContractAsync]);
 

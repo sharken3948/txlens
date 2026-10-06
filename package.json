@@ -15,6 +15,7 @@
     "contracts:build": "forge build",
     "contracts:test": "forge test",
     "build": "vite build",
+    "test": "bun test",
     "start:prod": "bun run server.ts"
   },
   "dependencies": {
@@ -32,6 +33,7 @@
     "@web3icons/react": "^4.0.0",
     "@x402/core": "^2.28.0",
     "@x402/evm": "^2.28.0",
+    "@motionone/easing": "^10.18.0",
     "clsx": "^2.1.1",
     "connectkit": "^1.9.2",
     "express": "^5.2.1",

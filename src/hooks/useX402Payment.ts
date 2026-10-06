@@ -6,6 +6,10 @@ import { useState, useCallback } from "react";
 import { useAccount, useSwitchChain, useSignTypedData } from "wagmi";
 import { arc } from "viem/chains";
 import { BatchEvmScheme } from "@circle-fin/x402-batching/client";
+import {
+  pickArcGatewayRequirement,
+  type GatewayPaymentRequirement,
+} from "@/payments/gateway";
 
 export const HDR_PAYMENT_REQUIRED = "payment-required";
 export const HDR_PAYMENT_SIGNATURE = "payment-signature";
@@ -13,15 +17,7 @@ export const HDR_PAYMENT_RESPONSE = "payment-response";
 
 const ARC_MAINNET_CHAIN_ID = arc.id;
 
-export interface PaymentRequirement {
-  scheme: string;
-  network: string;
-  asset: string;
-  amount: string;
-  payTo: string;
-  maxTimeoutSeconds: number;
-  extra?: Record<string, unknown>;
-}
+export type PaymentRequirement = GatewayPaymentRequirement;
 
 export interface PaymentRequired {
   x402Version: number;
@@ -63,19 +59,6 @@ function decodeBase64Json<T>(b64: string): T {
 
 function encodeBase64Json(obj: unknown): string {
   return btoa(JSON.stringify(obj));
-}
-
-function pickRequirement(
-  accepts: PaymentRequirement[]
-): PaymentRequirement | null {
-  if (!accepts || accepts.length === 0) return null;
-  return (
-    accepts.find(
-      (r) =>
-        r.network === "eip155:5042" ||
-        r.network === `eip155:${ARC_MAINNET_CHAIN_ID}`
-    ) ?? null
-  );
 }
 
 function formatUsdcAmount(raw: string): string {
@@ -136,7 +119,7 @@ export function useX402Payment({ url, body, onSuccess }: UseX402PaymentOptions) 
         return;
       }
 
-      const requirement = pickRequirement(paymentRequired.accepts ?? []);
+      const requirement = pickArcGatewayRequirement(paymentRequired.accepts ?? []);
       if (!requirement) {
         setState((s) => ({
           ...s,

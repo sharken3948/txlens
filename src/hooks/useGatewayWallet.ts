@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from "react";
 import { AppKit } from "@circle-fin/app-kit";
 import { createViemAdapterFromProvider } from "@circle-fin/adapter-viem-v2";
+import { Arc } from "@circle-fin/app-kit/chains";
 import { formatUnits, type EIP1193Provider } from "viem";
 import { useAccount, useChainId, useReadContract, useSwitchChain } from "wagmi";
 import { arc } from "viem/chains";
@@ -39,7 +40,13 @@ export function useGatewayWallet() {
     if (!connector) throw new Error("Connect your wallet first.");
     if (switchToArc && chainId !== arc.id) await switchChainAsync({ chainId: arc.id });
     const provider = (await connector.getProvider()) as EIP1193Provider;
-    return await createViemAdapterFromProvider({ provider });
+    return await createViemAdapterFromProvider({
+      provider,
+      capabilities: {
+        addressContext: "user-controlled",
+        supportedChains: [Arc],
+      },
+    });
   }, [chainId, connector, switchChainAsync]);
 
   const refresh = useCallback(async () => {
@@ -53,6 +60,7 @@ export function useGatewayWallet() {
       const balances = await appKit.unifiedBalance.getBalances({
         sources: { adapter },
         networkType: "mainnet",
+        token: "USDC",
       });
       setGatewayBalance(balances.totalConfirmedBalance ?? "0");
     } catch (err) {
@@ -73,6 +81,7 @@ export function useGatewayWallet() {
       const result = await appKit.unifiedBalance.deposit({
         from: { adapter, chain: "Arc" },
         amount: depositAmount,
+        token: "USDC",
         allowanceStrategy: "authorize",
       });
       setLastResult(result as unknown as Record<string, unknown>);
@@ -98,6 +107,7 @@ export function useGatewayWallet() {
       const result = await appKit.unifiedBalance.initiateRemoveFund({
         from: { adapter, chain: "Arc" },
         amount: withdrawAmount,
+        token: "USDC",
       });
       setLastResult(result as unknown as Record<string, unknown>);
       setStatus("withdrawal_pending");
@@ -114,6 +124,7 @@ export function useGatewayWallet() {
       const adapter = await getAdapter(true);
       const result = await appKit.unifiedBalance.removeFund({
         from: { adapter, chain: "Arc" },
+        token: "USDC",
       });
       setLastResult(result as unknown as Record<string, unknown>);
       setStatus("success");

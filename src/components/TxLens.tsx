@@ -116,14 +116,14 @@ function PaymentMethodSelector({
           className={`text-left rounded-xl border p-3 ${value === "direct" ? "border-[var(--accent)] bg-[var(--accent)]/10" : "border-[var(--border)]"}`}
         >
           <div className="flex items-center gap-2 font-semibold text-sm"><Wallet size={14} /> Direct USDC</div>
-          <div className="mt-1 text-xs text-[var(--muted)]">Best for one-time use. Pay from your Arc wallet; network gas applies.</div>
+          <div className="mt-1 text-xs text-[var(--muted)]">Best for one-time use. Pay directly from your Arc wallet; network gas applies. No Gateway funding required.</div>
         </button>
         <button
           onClick={() => onChange("gateway")}
           className={`text-left rounded-xl border p-3 ${value === "gateway" ? "border-[var(--accent)] bg-[var(--accent)]/10" : "border-[var(--border)]"}`}
         >
           <div className="flex items-center gap-2 font-semibold text-sm"><Zap size={14} /> Use Gateway</div>
-          <div className="mt-1 text-xs text-[var(--muted)]">Best for frequent requests. Fund once, then use gas-free nanopayments.</div>
+          <div className="mt-1 text-xs text-[var(--muted)]">Best for frequent requests. Fund once, then use Gateway Nanopayments with no per-request gas after funding.</div>
         </button>
       </div>
     </div>
@@ -194,7 +194,7 @@ function GatewayWalletPanel() {
           </button>
 
           <div className="text-[11px] text-[var(--subtle)]">
-            Gateway withdrawal is a two-step Circle flow with a mandatory 7-day activation period. Starting another withdrawal on Arc restarts that timer.
+            Circle's recovery withdrawal is a two-step flow with a mandatory 7-day activation delay. Starting another withdrawal on Arc adds to the pending amount and restarts that timer.
           </div>
           {gw.error && <div className="text-xs text-[var(--danger)]">{gw.error}</div>}
           {gw.lastResult && (
@@ -265,7 +265,7 @@ function DirectCheckout({
       <div className="flex justify-between gap-3">
         <div>
           <div className="font-semibold">Direct USDC</div>
-          <div className="text-xs text-[var(--subtle)]">One onchain Arc payment. No Gateway deposit required.</div>
+          <div className="text-xs text-[var(--subtle)]">One-time authorization for exactly {ROUTE_PRICES[route]} USDC — not an unlimited token approval.</div>
         </div>
         <span className="mono text-xs text-[var(--accent)]">{ROUTE_PRICES[route]} USDC + gas</span>
       </div>
@@ -279,6 +279,7 @@ function DirectCheckout({
            direct.status === "submitting" ? "Submit payment…" :
            direct.status === "confirming" ? "Confirming on Arc…" :
            direct.status === "verifying" ? "Verifying payment…" :
+           direct.txHash && direct.status === "error" ? "Retry paid request (no new charge)" :
            `Pay ${ROUTE_PRICES[route]} USDC & Continue`}
         </button>
       )}

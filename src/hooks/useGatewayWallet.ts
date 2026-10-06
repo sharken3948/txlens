@@ -1,16 +1,33 @@
 import { useCallback, useMemo, useState } from "react";
 import { AppKit } from "@circle-fin/app-kit";
 import { createViemAdapterFromProvider } from "@circle-fin/adapter-viem-v2";
-import type { EIP1193Provider } from "viem";
-import { useAccount, useChainId, useSwitchChain } from "wagmi";
+import { formatUnits, type EIP1193Provider } from "viem";
+import { useAccount, useChainId, useReadContract, useSwitchChain } from "wagmi";
 import { arc } from "viem/chains";
 
 const appKit = new AppKit();
+const ARC_USDC = "0x3600000000000000000000000000000000000000" as const;
+const ERC20_BALANCE_ABI = [{
+  type: "function",
+  name: "balanceOf",
+  stateMutability: "view",
+  inputs: [{ name: "account", type: "address" }],
+  outputs: [{ name: "", type: "uint256" }],
+}] as const;
 
 export function useGatewayWallet() {
   const { address, connector, isConnected } = useAccount();
   const chainId = useChainId();
   const { switchChainAsync } = useSwitchChain();
+  const { data: walletBalanceRaw, refetch: refetchWalletBalance } = useReadContract({
+    chainId: arc.id,
+    address: ARC_USDC,
+    abi: ERC20_BALANCE_ABI,
+    functionName: "balanceOf",
+    args: address ? [address] : undefined,
+    query: { enabled: Boolean(address) },
+  });
+  const walletBalance = walletBalanceRaw === undefined ? null : formatUnits(walletBalanceRaw, 6);
   const [gatewayBalance, setGatewayBalance] = useState<string | null>(null);
   const [depositAmount, setDepositAmount] = useState("0.10");
   const [withdrawAmount, setWithdrawAmount] = useState("0.10");
@@ -61,11 +78,12 @@ export function useGatewayWallet() {
       setLastResult(result as unknown as Record<string, unknown>);
       setStatus("success");
       await refresh();
+      await refetchWalletBalance();
     } catch (err) {
       setStatus("error");
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [depositAmount, getAdapter, refresh]);
+  }, [depositAmount, getAdapter, refresh, refetchWalletBalance]);
 
   const initiateWithdraw = useCallback(async () => {
     const amount = Number(withdrawAmount);
@@ -100,15 +118,17 @@ export function useGatewayWallet() {
       setLastResult(result as unknown as Record<string, unknown>);
       setStatus("success");
       await refresh();
+      await refetchWalletBalance();
     } catch (err) {
       setStatus("error");
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [getAdapter, refresh]);
+  }, [getAdapter, refresh, refetchWalletBalance]);
 
   return useMemo(() => ({
     address,
     isConnected,
+    walletBalance,
     gatewayBalance,
     depositAmount,
     setDepositAmount,
@@ -121,5 +141,5 @@ export function useGatewayWallet() {
     deposit,
     initiateWithdraw,
     completeWithdraw,
-  }), [address, completeWithdraw, deposit, depositAmount, error, gatewayBalance, initiateWithdraw, isConnected, lastResult, refresh, status, withdrawAmount]);
+  }), [address, completeWithdraw, deposit, depositAmount, error, gatewayBalance, initiateWithdraw, isConnected, lastResult, refresh, status, walletBalance, withdrawAmount]);
 }

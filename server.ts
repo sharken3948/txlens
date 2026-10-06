@@ -5,6 +5,8 @@
 import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { decodeFunctionData, keccak256, stringToHex } from "viem";
 import { createGatewayMiddleware } from "@circle-fin/x402-batching/server";
 
 function getArcRpcUrl(): string {
@@ -24,6 +26,39 @@ const ARC_MAINNET = {
 };
 
 const SELLER_ADDRESS = process.env.SELLER_WALLET_ADDRESS ?? "";
+const DIRECT_PAYMENT_SECRET = process.env.DIRECT_PAYMENT_SECRET ?? "";
+const ARC_USDC = "0x3600000000000000000000000000000000000000" as const;
+const DIRECT_PRICE_ATOMIC = { analyze: "2000", lookup: "3000" } as const;
+const QUOTE_TTL_SECONDS = 300;
+
+const USDC_AUTH_ABI = [{
+  type: "function",
+  name: "transferWithAuthorization",
+  stateMutability: "nonpayable",
+  inputs: [
+    { name: "from", type: "address" },
+    { name: "to", type: "address" },
+    { name: "value", type: "uint256" },
+    { name: "validAfter", type: "uint256" },
+    { name: "validBefore", type: "uint256" },
+    { name: "nonce", type: "bytes32" },
+    { name: "v", type: "uint8" },
+    { name: "r", type: "bytes32" },
+    { name: "s", type: "bytes32" },
+  ],
+  outputs: [],
+}] as const;
+
+type DirectRoute = "analyze" | "lookup";
+type DirectQuotePayload = {
+  route: DirectRoute;
+  bodyHash: string;
+  payer: string;
+  amount: string;
+  nonce: string;
+  validAfter: string;
+  validBefore: string;
+};
 
 const SELECTORS: Record<string, string> = {
   "0x095ea7b3": "approve(address,uint256)",
@@ -309,7 +344,7 @@ app.use((_req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader("Access-Control-Expose-Headers", "Payment-Required, Payment-Signature, Payment-Response");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Payment-Required, Payment-Signature, Payment-Response");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Payment-Required, Payment-Signature, Payment-Response, X-TxLens-Payment-Quote, X-TxLens-Payment-Tx");
   next();
 });
 app.options("/{*path}", (_req, res) => { res.sendStatus(204); });
@@ -317,12 +352,135 @@ app.options("/{*path}", (_req, res) => { res.sendStatus(204); });
 if (!/^0x[a-fA-F0-9]{40}$/.test(SELLER_ADDRESS)) {
   throw new Error("SELLER_WALLET_ADDRESS must be a valid EVM address.");
 }
+if (DIRECT_PAYMENT_SECRET.length < 32) {
+  throw new Error("DIRECT_PAYMENT_SECRET must be set to a strong secret (32+ chars).");
+}
+
+function stableBodyHash(body: unknown): string {
+  return keccak256(stringToHex(JSON.stringify(body ?? {})));
+}
+
+function signQuote(payload: DirectQuotePayload): string {
+  const raw = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const sig = createHmac("sha256", DIRECT_PAYMENT_SECRET).update(raw).digest("base64url");
+  return `${raw}.${sig}`;
+}
+
+function verifyQuote(token: string): DirectQuotePayload | null {
+  const [raw, sig] = token.split(".");
+  if (!raw || !sig) return null;
+  const expected = createHmac("sha256", DIRECT_PAYMENT_SECRET).update(raw).digest();
+  let actual: Buffer;
+  try { actual = Buffer.from(sig, "base64url"); } catch { return null; }
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as DirectQuotePayload;
+    if (BigInt(payload.validBefore) < BigInt(Math.floor(Date.now() / 1000))) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function verifyDirectPayment(route: DirectRoute, body: unknown, quoteToken: string, txHash: string) {
+  const quote = verifyQuote(quoteToken);
+  if (!quote) return { ok: false as const, error: "Invalid or expired direct payment quote." };
+  if (quote.route !== route || quote.bodyHash !== stableBodyHash(body)) {
+    return { ok: false as const, error: "Direct payment quote does not match this request." };
+  }
+  if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) {
+    return { ok: false as const, error: "Invalid payment transaction hash." };
+  }
+
+  const txResp = await fetch(getArcRpcUrl(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 31, method: "eth_getTransactionByHash", params: [txHash] }),
+  });
+  const receiptResp = await fetch(getArcRpcUrl(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 32, method: "eth_getTransactionReceipt", params: [txHash] }),
+  });
+  if (!txResp.ok || !receiptResp.ok) return { ok: false as const, error: "Could not verify direct payment on Arc." };
+
+  const txJson = await txResp.json() as { result?: EthTransaction | null };
+  const receiptJson = await receiptResp.json() as { result?: { status?: string } | null };
+  const tx = txJson.result;
+  if (!tx || receiptJson.result?.status !== "0x1") return { ok: false as const, error: "Direct payment transaction is missing or failed." };
+  if ((tx.to ?? "").toLowerCase() !== ARC_USDC.toLowerCase()) return { ok: false as const, error: "Direct payment did not call Arc USDC." };
+
+  try {
+    const decoded = decodeFunctionData({ abi: USDC_AUTH_ABI, data: tx.input as `0x${string}` });
+    if (decoded.functionName !== "transferWithAuthorization") throw new Error("wrong function");
+    const [from, to, value, validAfter, validBefore, nonce] = decoded.args;
+    if (String(from).toLowerCase() !== quote.payer.toLowerCase()) return { ok: false as const, error: "Direct payment payer mismatch." };
+    if (String(to).toLowerCase() !== SELLER_ADDRESS.toLowerCase()) return { ok: false as const, error: "Direct payment recipient mismatch." };
+    if (String(value) !== quote.amount) return { ok: false as const, error: "Direct payment amount mismatch." };
+    if (String(validAfter) !== quote.validAfter || String(validBefore) !== quote.validBefore) return { ok: false as const, error: "Direct payment authorization window mismatch." };
+    if (String(nonce).toLowerCase() !== quote.nonce.toLowerCase()) return { ok: false as const, error: "Direct payment nonce mismatch." };
+    return { ok: true as const, payer: quote.payer, txHash };
+  } catch {
+    return { ok: false as const, error: "Could not decode direct USDC authorization." };
+  }
+}
+
+async function requireDirectPayment(req: express.Request, res: express.Response, route: DirectRoute): Promise<boolean> {
+  const quote = req.header("x-txlens-payment-quote");
+  const txHash = req.header("x-txlens-payment-tx");
+  if (!quote || !txHash) {
+    res.status(402).json({
+      error: "Direct USDC payment required",
+      paymentMode: "direct",
+      quoteEndpoint: "/api/direct/quote",
+      network: "eip155:5042",
+      asset: ARC_USDC,
+      amount: DIRECT_PRICE_ATOMIC[route],
+      payTo: SELLER_ADDRESS,
+    });
+    return false;
+  }
+  const verification = await verifyDirectPayment(route, req.body, quote, txHash);
+  if (!verification.ok) {
+    res.status(402).json({ error: verification.error, paymentMode: "direct" });
+    return false;
+  }
+  return true;
+}
+
+app.post("/api/direct/quote", (req, res) => {
+  const route = req.body?.route as DirectRoute;
+  const payer = String(req.body?.payer ?? "");
+  const body = req.body?.body;
+  if ((route !== "analyze" && route !== "lookup") || !/^0x[a-fA-F0-9]{40}$/.test(payer) || !body) {
+    res.status(400).json({ error: "Invalid direct payment quote request." });
+    return;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const payload: DirectQuotePayload = {
+    route,
+    bodyHash: stableBodyHash(body),
+    payer,
+    amount: DIRECT_PRICE_ATOMIC[route],
+    nonce: `0x${randomBytes(32).toString("hex")}`,
+    validAfter: "0",
+    validBefore: String(now + QUOTE_TTL_SECONDS),
+  };
+  res.json({
+    token: signQuote(payload),
+    network: "eip155:5042",
+    asset: ARC_USDC,
+    payTo: SELLER_ADDRESS,
+    ...payload,
+  });
+});
 
 const gateway = createGatewayMiddleware({
   sellerAddress: SELLER_ADDRESS as `0x${string}`,
 });
 
-app.post("/api/analyze", gateway.require("$0.002"), (req, res) => {
+app.post("/api/analyze", async (req, res) => {
+  if (!(await requireDirectPayment(req, res, "analyze"))) return;
   if (Number(req.body?.chainId) !== ARC_MAINNET.chainId) {
     res.status(400).json({ error: "TxLens production supports Arc Mainnet only (chain ID 5042)." });
     return;
@@ -340,7 +498,8 @@ app.post("/api/analyze", gateway.require("$0.002"), (req, res) => {
   }
 });
 
-app.post("/api/lookup-tx", gateway.require("$0.003"), async (req, res) => {
+app.post("/api/lookup-tx", async (req, res) => {
+  if (!(await requireDirectPayment(req, res, "lookup"))) return;
   const body = req.body as { txHash: string; chainId: number };
   const { txHash, chainId } = body;
 
@@ -389,6 +548,52 @@ app.post("/api/lookup-tx", gateway.require("$0.003"), async (req, res) => {
       valueHex: tx.value,
       input: tx.input,
       status,
+      blockNumber: tx.blockNumber ? parseInt(tx.blockNumber, 16) : null,
+      network: ARC_MAINNET.name,
+      explorerUrl: `${ARC_MAINNET.explorer}/tx/${tx.hash}`,
+    },
+    ...analysis,
+  });
+});
+
+
+app.post("/api/analyze/gateway", gateway.require("$0.002"), (req, res) => {
+  if (Number(req.body?.chainId) !== ARC_MAINNET.chainId) {
+    res.status(400).json({ error: "TxLens production supports Arc Mainnet only (chain ID 5042)." });
+    return;
+  }
+  const body = req.body as AnalyzeRequest;
+  if (!body.to || typeof body.to !== "string") {
+    res.status(400).json({ error: "Missing required field: to" });
+    return;
+  }
+  try { res.json(analyze(body)); }
+  catch (err) { res.status(500).json({ error: "Internal analysis error", detail: String(err) }); }
+});
+
+app.post("/api/lookup-tx/gateway", gateway.require("$0.003"), async (req, res) => {
+  const body = req.body as { txHash: string; chainId: number };
+  const { txHash, chainId } = body;
+  if (!txHash || typeof txHash !== "string" || chainId !== ARC_MAINNET.chainId || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+    res.status(400).json({ error: "Invalid Arc Mainnet transaction lookup request." });
+    return;
+  }
+  const fetchResult = await fetchArcTransaction(txHash);
+  if (!fetchResult.ok) { res.status(404).json({ error: fetchResult.error }); return; }
+  const { tx } = fetchResult;
+  const status = await fetchTransactionStatus(txHash);
+  let valueDecimal = "0";
+  try { valueDecimal = hexToBigInt(tx.value).toString(); } catch {}
+  const analysis = analyze({
+    chainId,
+    to: tx.to ?? "0x0000000000000000000000000000000000000000",
+    data: tx.input,
+    value: valueDecimal,
+  });
+  res.json({
+    transaction: {
+      hash: tx.hash, from: tx.from, to: tx.to, value: valueDecimal, valueHex: tx.value,
+      input: tx.input, status,
       blockNumber: tx.blockNumber ? parseInt(tx.blockNumber, 16) : null,
       network: ARC_MAINNET.name,
       explorerUrl: `${ARC_MAINNET.explorer}/tx/${tx.hash}`,

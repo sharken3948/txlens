@@ -27,6 +27,8 @@ export interface PaymentRequired {
   x402Version: number;
   accepts: PaymentRequirement[];
   error?: string;
+  resource?: unknown;
+  extensions?: unknown;
 }
 
 export type PaymentStatus =
@@ -200,12 +202,24 @@ export function useX402Payment({ url, body, onSuccess }: UseX402PaymentOptions) 
 
       const batchScheme = new BatchEvmScheme(evmSigner);
 
-      let paymentPayload: { x402Version: number; payload: unknown };
+      let paymentPayload: {
+        x402Version: number;
+        accepted: PaymentRequirement;
+        payload: unknown;
+        resource?: unknown;
+        extensions?: unknown;
+      };
       try {
-        paymentPayload = await batchScheme.createPaymentPayload(
+        const schemePayload = await batchScheme.createPaymentPayload(
           paymentRequired.x402Version ?? 2,
           requirement
         );
+        paymentPayload = {
+          ...schemePayload,
+          accepted: requirement,
+          ...(paymentRequired.resource ? { resource: paymentRequired.resource } : {}),
+          ...(paymentRequired.extensions ? { extensions: paymentRequired.extensions } : {}),
+        };
       } catch (err) {
         const msg = String(err);
         if (msg.toLowerCase().includes("user rejected") || msg.includes("4001")) {

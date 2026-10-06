@@ -273,13 +273,24 @@ export function useX402Payment({ url, body, onSuccess }: UseX402PaymentOptions) 
       const retryJson = (await retryResp.json()) as unknown;
 
       if (!retryResp.ok) {
+        const retryError = retryJson as {
+          error?: string;
+          reason?: string;
+          invalidReason?: string;
+          errorReason?: string;
+        };
+        const detail =
+          retryError.reason ??
+          retryError.invalidReason ??
+          retryError.errorReason ??
+          null;
         setState((s) => ({
           ...s,
           status: "verification_failed",
           paymentResponse,
-          error:
-            (retryJson as { error?: string }).error ??
-            `Server returned ${retryResp.status} after payment.`,
+          error: detail
+            ? `${retryError.error ?? `Server returned ${retryResp.status} after payment.`} — ${detail}`
+            : retryError.error ?? `Server returned ${retryResp.status} after payment.`,
         }));
         return;
       }

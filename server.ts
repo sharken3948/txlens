@@ -406,8 +406,18 @@ const gateway = createGatewayMiddleware({
   networks: ARC_NETWORK,
 });
 
-app.post("/api/analyze", async (req, res) => {
-  if (!(await requireDirectPayment(req, res, "analyze"))) return;
+function requireMahsharAuth(tokenEnvironment: "MAHSHAR_ANALYZE_API_TOKEN" | "MAHSHAR_LOOKUP_API_TOKEN"): express.RequestHandler {
+  return (req, res, next) => {
+    const token = process.env[tokenEnvironment];
+    if (!token || req.header("authorization") !== `Bearer ${token}`) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    next();
+  };
+}
+
+async function fulfillAnalyze(req: express.Request, res: express.Response): Promise<void> {
   if (Number(req.body?.chainId) !== ARC_MAINNET.chainId) {
     res.status(400).json({ error: "TxLens production supports Arc Mainnet only (chain ID 5042)." });
     return;
@@ -423,10 +433,9 @@ app.post("/api/analyze", async (req, res) => {
     console.error("[TxLens] analyze error:", err);
     res.status(500).json({ error: "Internal analysis error", detail: String(err) });
   }
-});
+}
 
-app.post("/api/lookup-tx", async (req, res) => {
-  if (!(await requireDirectPayment(req, res, "lookup"))) return;
+async function fulfillLookupTransaction(req: express.Request, res: express.Response): Promise<void> {
   const body = req.body as { txHash: string; chainId: number };
   const { txHash, chainId } = body;
 
@@ -481,8 +490,28 @@ app.post("/api/lookup-tx", async (req, res) => {
     },
     ...analysis,
   });
+}
+
+app.post("/api/analyze", async (req, res) => {
+  if (!(await requireDirectPayment(req, res, "analyze"))) return;
+  await fulfillAnalyze(req, res);
 });
 
+app.post("/api/lookup-tx", async (req, res) => {
+  if (!(await requireDirectPayment(req, res, "lookup"))) return;
+  await fulfillLookupTransaction(req, res);
+});
+
+app.post(
+  "/api/internal/mahshar/analyze",
+  requireMahsharAuth("MAHSHAR_ANALYZE_API_TOKEN"),
+  fulfillAnalyze,
+);
+app.post(
+  "/api/internal/mahshar/lookup-tx",
+  requireMahsharAuth("MAHSHAR_LOOKUP_API_TOKEN"),
+  fulfillLookupTransaction,
+);
 
 app.post("/api/analyze/gateway", gateway.require("$0.002"), async (req, res) => {
   const body = req.body as AnalyzeRequest;
@@ -545,6 +574,10 @@ app.get("/{*path}", (req, res, next) => {
 });
 
 const PORT = Number(process.env.PORT ?? 3001);
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[TxLens] server listening on 0.0.0.0:${PORT}`);
-});
+if (import.meta.main) {
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`[TxLens] server listening on 0.0.0.0:${PORT}`);
+  });
+}
+
+export { app };

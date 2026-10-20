@@ -6,7 +6,8 @@ import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createGatewayMiddleware } from "@circle-fin/x402-batching/server";
-import { analyzeWithEnrichment, type ReceiptLog } from "./src/server/abiEnrichment";
+import { analyzeWithEnrichment } from "./src/server/abiEnrichment";
+import { lookupArcTransaction } from "./src/server/arcLookup";
 import {
   ARC_NETWORK,
   ARC_USDC,
@@ -76,19 +77,6 @@ interface AnalyzeRequest {
   to: string;
   data?: string;
   value?: string;
-}
-
-interface EthTransaction {
-  hash: string;
-  from: string;
-  to: string | null;
-  input: string;
-  value: string;
-  blockNumber: string | null;
-  transactionIndex: string | null;
-  gas: string;
-  gasPrice: string;
-  nonce: string;
 }
 
 function hexToAddress(hex: string): string {
@@ -265,58 +253,6 @@ function analyze(req: AnalyzeRequest): AnalysisResult {
   };
 }
 
-async function fetchArcTransaction(
-  txHash: string
-): Promise<{ ok: true; tx: EthTransaction } | { ok: false; error: string }> {
-  let resp: Response;
-  try {
-    resp = await fetch(getArcRpcUrl(), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getTransactionByHash", params: [txHash] }),
-    });
-  } catch (err) {
-    return { ok: false, error: `RPC request failed: ${String(err)}` };
-  }
-
-  if (!resp.ok) return { ok: false, error: `RPC HTTP error ${resp.status}` };
-
-  interface JsonRpcResponse { result: EthTransaction | null; error?: { message: string }; }
-  let body: JsonRpcResponse;
-  try {
-    body = (await resp.json()) as JsonRpcResponse;
-  } catch {
-    return { ok: false, error: "Invalid JSON from RPC endpoint." };
-  }
-
-  if (body.error) return { ok: false, error: `RPC error: ${body.error.message}` };
-  if (!body.result) return { ok: false, error: `Transaction ${txHash} not found on Arc Mainnet.` };
-  return { ok: true, tx: body.result };
-}
-
-async function fetchTransactionReceipt(txHash: string): Promise<{
-  status: "success" | "failed" | "pending" | "unknown";
-  logs: ReceiptLog[];
-}> {
-  try {
-    const resp = await fetch(getArcRpcUrl(), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_getTransactionReceipt", params: [txHash] }),
-    });
-    if (!resp.ok) return { status: "unknown", logs: [] };
-    interface ReceiptResponse { result: { status: string; logs?: ReceiptLog[] } | null; error?: { message: string }; }
-    const body = (await resp.json()) as ReceiptResponse;
-    if (body.error || !body.result) return { status: "pending", logs: [] };
-    return {
-      status: body.result.status === "0x1" ? "success" : "failed",
-      logs: Array.isArray(body.result.logs) ? body.result.logs : [],
-    };
-  } catch {
-    return { status: "unknown", logs: [] };
-  }
-}
-
 const app = express();
 app.use(express.json());
 
@@ -436,7 +372,7 @@ async function fulfillAnalyze(req: express.Request, res: express.Response): Prom
 }
 
 async function fulfillLookupTransaction(req: express.Request, res: express.Response): Promise<void> {
-  const body = req.body as { txHash: string; chainId: number };
+  const body = (req.body ?? {}) as { txHash: string; chainId: number };
   const { txHash, chainId } = body;
 
   if (!txHash || typeof txHash !== "string") {
@@ -456,24 +392,28 @@ async function fulfillLookupTransaction(req: express.Request, res: express.Respo
     return;
   }
 
-  const fetchResult = await fetchArcTransaction(txHash);
+  const fetchResult = await lookupArcTransaction(txHash);
   if (!fetchResult.ok) {
-    res.status(404).json({ error: fetchResult.error });
+    if (fetchResult.httpStatus === 503) res.setHeader("Retry-After", "2");
+    res.status(fetchResult.httpStatus).json({
+      error: fetchResult.error,
+      ...(fetchResult.code ? { code: fetchResult.code, retryable: true } : {}),
+    });
     return;
   }
 
-  const { tx } = fetchResult;
-  const receipt = await fetchTransactionReceipt(txHash);
+  const { tx, status, logs } = fetchResult;
 
   let valueDecimal = "0";
   try { valueDecimal = hexToBigInt(tx.value).toString(); } catch { valueDecimal = "0"; }
 
+  // Lookup RPC work is capped at 5s; existing enrichment gets at most 3s.
   const analysis = await analyzeWithEnrichment({
     chainId,
     to: tx.to ?? "0x0000000000000000000000000000000000000000",
     data: tx.input,
     value: valueDecimal
-  }, { logs: receipt.logs });
+  }, { logs, timeoutMs: 3_000 });
 
   res.json({
     transaction: {
@@ -483,7 +423,7 @@ async function fulfillLookupTransaction(req: express.Request, res: express.Respo
       value: valueDecimal,
       valueHex: tx.value,
       input: tx.input,
-      status: receipt.status,
+      status,
       blockNumber: tx.blockNumber ? parseInt(tx.blockNumber, 16) : null,
       network: ARC_MAINNET.name,
       explorerUrl: `${ARC_MAINNET.explorer}/tx/${tx.hash}`,
@@ -528,34 +468,13 @@ app.post("/api/analyze/gateway", gateway.require("$0.002"), async (req, res) => 
 });
 
 app.post("/api/lookup-tx/gateway", gateway.require("$0.003"), async (req, res) => {
-  const body = req.body as { txHash: string; chainId: number };
+  const body = (req.body ?? {}) as { txHash: string; chainId: number };
   const { txHash, chainId } = body;
   if (!txHash || typeof txHash !== "string" || chainId !== ARC_MAINNET.chainId || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
     res.status(400).json({ error: "Invalid Arc Mainnet transaction lookup request." });
     return;
   }
-  const fetchResult = await fetchArcTransaction(txHash);
-  if (!fetchResult.ok) { res.status(404).json({ error: fetchResult.error }); return; }
-  const { tx } = fetchResult;
-  const receipt = await fetchTransactionReceipt(txHash);
-  let valueDecimal = "0";
-  try { valueDecimal = hexToBigInt(tx.value).toString(); } catch {}
-  const analysis = await analyzeWithEnrichment({
-    chainId,
-    to: tx.to ?? "0x0000000000000000000000000000000000000000",
-    data: tx.input,
-    value: valueDecimal,
-  }, { logs: receipt.logs });
-  res.json({
-    transaction: {
-      hash: tx.hash, from: tx.from, to: tx.to, value: valueDecimal, valueHex: tx.value,
-      input: tx.input, status: receipt.status,
-      blockNumber: tx.blockNumber ? parseInt(tx.blockNumber, 16) : null,
-      network: ARC_MAINNET.name,
-      explorerUrl: `${ARC_MAINNET.explorer}/tx/${tx.hash}`,
-    },
-    ...analysis,
-  });
+  await fulfillLookupTransaction(req, res);
 });
 
 const __filename = fileURLToPath(import.meta.url);

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { encodeEventTopics, encodeFunctionData, parseAbi } from "viem";
 import { ARC_MEMO_ADDRESS, ARC_NATIVE_USDC } from "../src/server/contractMetadata";
+import { createDirectQuote, USDC_AUTH_ABI } from "../src/server/directPayment";
 
 const SELLER = "0x540a0027509B1C9aA0a2c5C65491cC97083E16de";
 const ANALYZE_TOKEN = "mahshar-analyze-test-token";
@@ -65,8 +66,8 @@ function routeHandlers(path: string): Array<(req: any, res: any, next: (error?: 
   return layer.route.stack.map((entry: any) => entry.handle);
 }
 
-async function invoke(path: string, body: unknown, token?: string): Promise<MockResponse> {
-  const headers: Record<string, string> = {};
+async function invoke(path: string, body: unknown, token?: string, extraHeaders: Record<string, string> = {}): Promise<MockResponse> {
+  const headers: Record<string, string> = { ...extraHeaders };
   if (token !== undefined) headers.authorization = `Bearer ${token}`;
   const req = {
     body,
@@ -96,9 +97,12 @@ async function invoke(path: string, body: unknown, token?: string): Promise<Mock
   return res;
 }
 
-function mockArcRpc(): void {
+function mockArcRpc(options: { missingTransaction?: boolean; missingReceipt?: boolean; receiptError?: boolean } = {}): void {
   globalThis.fetch = async (_input, init) => {
     const request = JSON.parse(String(init?.body)) as { id: number; method: string };
+    if (request.method === "eth_getTransactionReceipt" && options.receiptError) {
+      return Response.json({ jsonrpc: "2.0", id: request.id, error: { message: "private provider diagnostic" } });
+    }
     const result = request.method === "eth_getTransactionByHash"
       ? {
           hash: TX_HASH,
@@ -107,6 +111,7 @@ function mockArcRpc(): void {
           input: MEMO_INPUT,
           value: "0x0",
           blockNumber: "0x10",
+          blockHash: `0x${"cd".repeat(32)}`,
           transactionIndex: "0x0",
           gas: "0x5208",
           gasPrice: "0x1",
@@ -114,11 +119,16 @@ function mockArcRpc(): void {
         }
       : request.method === "eth_getTransactionReceipt"
         ? {
+            transactionHash: TX_HASH,
+            blockNumber: "0x10",
+            blockHash: `0x${"cd".repeat(32)}`,
             status: "0x1",
             logs: [{ address: ARC_MEMO_ADDRESS, topics: BEFORE_MEMO_TOPICS, data: "0x" }],
           }
-        : null;
-    return Response.json({ jsonrpc: "2.0", id: request.id, result });
+        : request.method === "eth_chainId" ? "0x13b2" : null;
+    const missing = request.method === "eth_getTransactionByHash" && options.missingTransaction ||
+      request.method === "eth_getTransactionReceipt" && options.missingReceipt;
+    return Response.json({ jsonrpc: "2.0", id: request.id, result: missing ? null : result });
   };
 }
 
@@ -206,6 +216,44 @@ describe("Mahshar internal fulfillment", () => {
     expect(body.events?.[0]?.arguments?.memoIndex).toBe("7");
   });
 
+  test("fallback fulfillment preserves the existing response shape and event enrichment", async () => {
+    mockArcRpc();
+    const workingRpc = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const { method, id } = JSON.parse(String(init?.body));
+      if (String(input) === "https://rpc.mainnet.arc.io" && method !== "eth_chainId") {
+        return Response.json({ jsonrpc: "2.0", id, result: null });
+      }
+      return workingRpc(input, init);
+    };
+    const result = await invoke("/api/internal/mahshar/lookup-tx", { chainId: 5042, txHash: TX_HASH }, LOOKUP_TOKEN);
+    expect(result.statusCode).toBe(200);
+    const body = result.body as Record<string, any>;
+    expect(body.transaction).toMatchObject({ hash: TX_HASH, blockNumber: 16, status: "success", network: "Arc Mainnet" });
+    expect(Object.keys(body.transaction).sort()).toEqual(["hash", "from", "to", "value", "valueHex", "input", "status", "blockNumber", "network", "explorerUrl"].sort());
+    expect(body.events?.[0]?.arguments?.memoIndex).toBe("7");
+  });
+
+  for (const receiptError of [false, true]) {
+    test(`mined transaction with ${receiptError ? "RPC receipt error" : "missing receipt"} returns a sanitized retryable 503`, async () => {
+      mockArcRpc({ missingReceipt: true, receiptError });
+      const result = await invoke("/api/internal/mahshar/lookup-tx", { chainId: 5042, txHash: TX_HASH }, LOOKUP_TOKEN);
+      expect(result.statusCode).toBe(503);
+      expect(result.headers["retry-after"]).toBe("2");
+      expect(result.body).toMatchObject({ code: "receipt_unavailable", retryable: true });
+      expect(result.body).not.toHaveProperty("transaction");
+      expect(JSON.stringify(result.body)).not.toMatch(/pending|private|https:/);
+    });
+  }
+
+  test("consistent absence preserves the existing 404 error response", async () => {
+    mockArcRpc({ missingTransaction: true, missingReceipt: true });
+    const result = await invoke("/api/internal/mahshar/lookup-tx", { chainId: 5042, txHash: TX_HASH }, LOOKUP_TOKEN);
+    expect(result.statusCode).toBe(404);
+    expect(result.body).toEqual({ error: `Transaction ${TX_HASH} not found on Arc Mainnet.` });
+    expect(result.headers["retry-after"]).toBeUndefined();
+  });
+
   for (const [path, body, token] of [
     ["/api/internal/mahshar/analyze", { chainId: 1, to: ARC_MEMO_ADDRESS, data: MEMO_INPUT }, ANALYZE_TOKEN],
     ["/api/internal/mahshar/lookup-tx", { chainId: 1, txHash: TX_HASH }, LOOKUP_TOKEN],
@@ -219,6 +267,58 @@ describe("Mahshar internal fulfillment", () => {
 });
 
 describe("public payment boundaries", () => {
+  test("Direct fulfillment verifies the existing payment once while lookup retries remain read-only", async () => {
+    const body = { chainId: 5042, txHash: TX_HASH };
+    const quote = createDirectQuote({
+      route: "lookup", payer: SENDER, body, sellerAddress: SELLER,
+      secret: process.env.DIRECT_PAYMENT_SECRET!,
+    });
+    const paymentHash = `0x${"ef".repeat(32)}`;
+    const paymentInput = encodeFunctionData({
+      abi: USDC_AUTH_ABI,
+      functionName: "transferWithAuthorization",
+      args: [SENDER, SELLER, BigInt(quote.amount), BigInt(quote.validAfter), BigInt(quote.validBefore),
+        quote.nonce as `0x${string}`, 27, `0x${"66".repeat(32)}`, `0x${"77".repeat(32)}`],
+    });
+    mockArcRpc({ missingReceipt: true });
+    const lookupRpc = globalThis.fetch;
+    const paymentReads: string[] = [];
+    const lookupReads: string[] = [];
+    globalThis.fetch = async (input, init) => {
+      const request = JSON.parse(String(init?.body));
+      if (request.params[0] === paymentHash || request.method === "eth_getBlockByNumber") {
+        paymentReads.push(request.method);
+        const result = request.method === "eth_getTransactionByHash" ? { to: ARC_NATIVE_USDC, input: paymentInput, blockNumber: "0x10" }
+          : request.method === "eth_getTransactionReceipt" ? { status: "0x1", blockNumber: "0x10" }
+          : { timestamp: `0x${Math.floor(Date.now() / 1_000).toString(16)}` };
+        return Response.json({ jsonrpc: "2.0", id: request.id, result });
+      }
+      lookupReads.push(request.method);
+      return lookupRpc(input, init);
+    };
+    const result = await invoke("/api/lookup-tx", body, undefined, {
+      "x-txlens-payment-quote": quote.token,
+      "x-txlens-payment-tx": paymentHash,
+    });
+    expect(result.statusCode).toBe(503);
+    expect(result.body).toMatchObject({ code: "receipt_unavailable", retryable: true });
+    expect(paymentReads.sort()).toEqual(["eth_getBlockByNumber", "eth_getTransactionByHash", "eth_getTransactionReceipt"]);
+    expect(lookupReads).toHaveLength(12);
+    expect(lookupReads.every(method => ["eth_chainId", "eth_getTransactionByHash", "eth_getTransactionReceipt"].includes(method))).toBe(true);
+  });
+
+  test("Gateway fulfillment after authorization shares receipt-unavailable handling", async () => {
+    mockArcRpc({ missingReceipt: true });
+    // Exercise only the post-authorization callback; the middleware's unpaid
+    // boundary is tested below. No facilitator/settlement request is performed.
+    const fulfill = routeHandlers("/api/lookup-tx/gateway").at(-1)!;
+    const result = response();
+    await fulfill({ body: { chainId: 5042, txHash: TX_HASH } }, result, () => {});
+    expect(result.statusCode).toBe(503);
+    expect(result.headers["retry-after"]).toBe("2");
+    expect(result.body).toMatchObject({ code: "receipt_unavailable", retryable: true });
+  });
+
   test("public Direct USDC endpoints still require payment", async () => {
     expect((await invoke("/api/analyze", { chainId: 5042, to: ARC_MEMO_ADDRESS, data: MEMO_INPUT })).statusCode).toBe(402);
     expect((await invoke("/api/lookup-tx", { chainId: 5042, txHash: TX_HASH })).statusCode).toBe(402);
